@@ -48,7 +48,9 @@ SOURCE_WEIGHT = {"gr_most_read": 1.0, "gr_shelf": 0.9, "ol_trending": 0.5}
 
 TRENDING_PER_LIST = 50       # quantos livros pegar de cada lista
 TRENDING_MAX = 300           # tamanho máximo do pool de trending
-CATALOG_PAGES_PER_GENRE = 4  # páginas de ~50 livros por gênero no modo --catalog (≈ 1.400 livros)
+CATALOG_LISTS_PER_GENRE = 3  # listas (Listopia) por gênero no modo --catalog
+CATALOG_PAGES_PER_LIST = 3   # páginas de 100 livros por lista  (7 gêneros × 3 × 3 × 100 ≈ 4–5 mil ids antes da deduplicação)
+CATALOG_MAX = 1500           # teto de sementes novas por rodada (o resto fica pendente para as próximas)
 TOP_SHELVES = 40             # shelves por livro
 SLEEP = 1.0                  # segundos entre requisições ao Goodreads (seja gentil)
 TIME_BUDGET_MIN = 300        # para antes do limite de 6 h do GitHub Actions e grava o que já tem
@@ -120,6 +122,26 @@ def gr_most_read(genre: str) -> list[str]:
     return gr_book_ids(r.text)[:TRENDING_PER_LIST] if r else []
 
 
+def gr_genre_lists(genre: str) -> list[str]:
+    """Ids das listas (Listopia) ligadas na página do gênero — públicas e paginadas, ao contrário das shelves."""
+    r = get(f"https://www.goodreads.com/genres/{genre}")
+    time.sleep(SLEEP)
+    if not r:
+        return []
+    seen, out = set(), []
+    for m in re.finditer(r"/list/show/(\d+)", r.text):
+        if m.group(1) not in seen:
+            seen.add(m.group(1))
+            out.append(m.group(1))
+    return out[:CATALOG_LISTS_PER_GENRE]
+
+
+def gr_list(list_id: str, page: int) -> list[str]:
+    r = get(f"https://www.goodreads.com/list/show/{list_id}", params={"page": page})
+    time.sleep(SLEEP)
+    return gr_book_ids(r.text) if r else []
+
+
 def gr_shelf(shelf: str, page: int = 1) -> list[str]:
     r = get(f"https://www.goodreads.com/shelf/show/{shelf}", params={"page": page})
     time.sleep(SLEEP)
@@ -165,6 +187,8 @@ def gr_book(book_id: str) -> dict | None:
     year = int(time.gmtime(pub / 1000).tm_year) if pub else None
 
     genres = [g["genre"]["name"].lower().replace(" ", "-") for g in book.get("bookGenres", []) if g.get("genre")]
+    desc = BeautifulSoup(book.get("description") or "", "html.parser").get_text(" ", strip=True)
+    desc = re.sub(r"\s+", " ", desc)[:1200]
 
     info = {
         "id": book_id,
@@ -175,6 +199,7 @@ def gr_book(book_id: str) -> dict | None:
         "rating": stats.get("averageRating"),
         "n": stats.get("ratingsCount"),
         "cover": book.get("imageUrl"),
+        "d": desc,
         "genres": genres,
         "tags": gr_shelves(book_id),
     }
@@ -240,6 +265,11 @@ def ol_work(key: str) -> dict | None:
     if not r or not r.json().get("docs"):
         return None
     d = r.json()["docs"][0]
+    desc = ""
+    w = get(f"https://openlibrary.org{key}.json")
+    if w:
+        raw = w.json().get("description") or ""
+        desc = re.sub(r"\s+", " ", raw["value"] if isinstance(raw, dict) else raw)[:1200]
     return {
         "id": "ol" + key.rsplit("/", 1)[-1],
         "t": d.get("title", ""),
@@ -249,6 +279,7 @@ def ol_work(key: str) -> dict | None:
         "rating": d.get("ratings_average"),
         "n": d.get("ratings_count"),
         "cover": f"https://covers.openlibrary.org/b/id/{d['cover_i']}-M.jpg" if d.get("cover_i") else None,
+        "d": desc,
         "genres": [],
         "tags": ol_tags(d.get("subject") or []),
     }
@@ -331,7 +362,7 @@ def main():
 
     # -- 2. perfil de cada livro (com cache)
     def profile(bid: str) -> dict | None:
-        if bid in cache and cache[bid].get("tags"):
+        if bid in cache and cache[bid].get("tags") and "d" in cache[bid]:
             return cache[bid]
         if bid.startswith("/works/"):
             info = ol_work(bid)
@@ -357,13 +388,23 @@ def main():
 
     # -- 3. catálogo de sementes
     catalog_ids: set[str] = {b["id"] for b in prev.get("catalog", [])}
-    catalog_ids.update(load_json(ROOT / "data" / "pending.json", []))
+    pending_prev = load_json(ROOT / "data" / "pending.json", [])
+    catalog_ids.update(pending_prev[:CATALOG_MAX])
+    overflow: list[str] = pending_prev[CATALOG_MAX:]
     if args.catalog or not catalog_ids:
         log("reconstruindo catálogo de sementes…")
         if mode == "goodreads":
+            new_ids: list[str] = []
             for g in GENRES:
-                for p in range(1, CATALOG_PAGES_PER_GENRE + 1):
-                    catalog_ids.update(gr_shelf(g, p))
+                for lid in gr_genre_lists(g):
+                    for p in range(1, CATALOG_PAGES_PER_LIST + 1):
+                        new_ids.extend(gr_list(lid, p))
+                catalog_ids.update(gr_shelf(g, 1))
+            # sem repetir, na ordem das listas (as primeiras posições são os mais votados)
+            new_ids = list(dict.fromkeys(new_ids))
+            log(f"  {len(new_ids)} ids vindos das listas; lendo até {CATALOG_MAX} nesta rodada")
+            catalog_ids.update(new_ids[:CATALOG_MAX])
+            overflow = new_ids[CATALOG_MAX:]
         else:
             for g in ["fantasy", "science fiction", "romance", "thriller", "mystery"]:
                 for p in range(1, 4):
@@ -401,8 +442,9 @@ def main():
     MISSES.write_text("[]")
     # sementes que não deu tempo de ler ficam anotadas para a próxima rodada completar
     PENDING = ROOT / "data" / "pending.json"
-    PENDING.write_text(json.dumps([b for b in ordered if b not in cache]) if pending else "[]")
-    log(f"ok: {len(trending)} trending, {len(catalog)} sementes, {pending} pendentes → {OUT}  ({(time.time()-t0)/60:.0f} min)")
+    left = list(dict.fromkeys([b for b in ordered if b not in cache] + overflow))
+    PENDING.write_text(json.dumps(left))
+    log(f"ok: {len(trending)} trending, {len(catalog)} sementes, {len(left)} pendentes para as próximas rodadas → {OUT}  ({(time.time()-t0)/60:.0f} min)")
 
 
 def find_id(title: str, mode: str) -> str | None:
