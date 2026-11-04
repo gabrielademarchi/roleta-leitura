@@ -168,6 +168,11 @@ h1{
 .chips{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 0;padding:0;list-style:none}
 .chips li{font-size:13.5px;padding:5px 11px;border-radius:999px;border:1px solid var(--line);color:var(--ink-2)}
 .chips li.hi{border-color:var(--orange);background:color-mix(in srgb,var(--orange) 18%,transparent);color:var(--orange-ink)}
+.syn{margin:20px 0 0;color:var(--ink-2);font-size:15px;line-height:1.55;max-width:46ch}
+.syn p{margin:0;display:-webkit-box;-webkit-line-clamp:5;-webkit-box-orient:vertical;overflow:hidden}
+.syn.open p{display:block;-webkit-line-clamp:unset}
+.syn button{background:none;border:0;padding:0;margin-top:4px;color:var(--blue);font:inherit;font-size:14px;cursor:pointer;text-decoration:underline;text-underline-offset:3px}
+.syn:not(.long) button{display:none}
 .again{margin-top:22px;display:flex;gap:18px;align-items:center;flex-wrap:wrap}
 .again button{
   background:none;border:1.5px solid var(--blue);color:var(--blue);border-radius:999px;
@@ -213,6 +218,7 @@ footer{margin-top:46px;color:var(--ink-3);font-size:13px;line-height:1.5;max-wid
     </div>
     <p class="why">Caiu aqui porque, como <b id="rseed"></b>, ele é</p>
     <ul class="chips" id="chips"></ul>
+    <div class="syn" id="syn"><p id="rsyn"></p><button type="button" id="synmore">ler mais</button></div>
     <div class="again">
       <button type="button" id="again">Girar de novo</button>
       <a id="gr" href="#" target="_blank" rel="noopener">ver no Goodreads</a>
@@ -391,6 +397,7 @@ function go(){
   track.addEventListener("transitionend",finish,{once:true});
 }
 spin.addEventListener("click",go);
+$("synmore").addEventListener("click",()=>{const s=$("syn");s.classList.toggle("open");$("synmore").textContent=s.classList.contains("open")?"ler menos":"ler mais"});
 $("again").addEventListener("click",()=>{go();window.scrollTo({top:$("spin").offsetTop-220,behavior:reduced?"auto":"smooth"})});
 
 function show(win,cands){
@@ -402,6 +409,9 @@ function show(win,cands){
   const tags=sharedTags(seed,b);
   $("chips").innerHTML=tags.map((k,i)=>`<li class="${i===0?"hi":""}">${esc(pt(k))}</li>`).join("");
   $("gr").href="https://www.goodreads.com/search?q="+encodeURIComponent(b.t+" "+b.a);
+  const syn=$("syn");syn.classList.remove("open");
+  if(b.d){$("rsyn").textContent=b.d;syn.style.display="";syn.classList.toggle("long",b.d.length>420);$("synmore").textContent="ler mais"}
+  else syn.style.display="none";
   result.classList.add("on");
 }
 </script>
