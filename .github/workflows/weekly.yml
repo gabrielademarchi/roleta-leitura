@@ -1,0 +1,42 @@
+name: Atualizar roleta
+
+on:
+  schedule:
+    - cron: "0 9 * * 1"     # toda segunda, 09:00 UTC (06:00 em Brasília)
+    - cron: "0 10 1 * *"    # dia 1 de cada mês: reconstrói o catálogo de sementes
+  workflow_dispatch:        # botão "Run workflow" para rodar na mão
+    inputs:
+      catalog:
+        description: "Reconstruir o catálogo de sementes?"
+        type: boolean
+        default: false
+      source:
+        description: "Fonte (goodreads ou openlibrary)"
+        default: goodreads
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Rodar o robô
+        run: |
+          FLAGS="--source ${{ github.event.inputs.source || 'goodreads' }}"
+          if [ "${{ github.event.inputs.catalog }}" = "true" ] || [ "${{ github.event.schedule }}" = "0 10 1 * *" ]; then
+            FLAGS="$FLAGS --catalog"
+          fi
+          python build_pool.py $FLAGS
+      - name: Salvar dados no repositório
+        run: |
+          git config user.name "roleta-bot"
+          git config user.email "roleta-bot@users.noreply.github.com"
+          git add data/
+          git diff --cached --quiet || git commit -m "dados: $(date -u +%Y-%m-%d)"
+          git push
