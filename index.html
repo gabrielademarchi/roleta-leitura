@@ -13,15 +13,15 @@
   padding-top:env(safe-area-inset-top,0px);
   padding-bottom:env(safe-area-inset-bottom,0px);
   /* paleta do Livros e etc: bege, azul, laranja, vermelho */
-  --paper:#EFE6D8;
-  --paper-2:#E6DCCA;
-  --paper-3:#F7F1E6;
+  --paper:#FEF5E8;
+  --paper-2:#F3E8D6;
+  --paper-3:#FFFBF4;
   --ink:#121B5C;
   --ink-2:#3A4380;
   --ink-3:#7A80A4;
-  --line:#D4C9B3;
+  --line:#E2D5BF;
   --blue:#16289B;
-  --blue-ink:#EFE6D8;
+  --blue-ink:#FEF5E8;
   --orange:#FC9B4E;
   --orange-ink:#8A4A12;
   --red:#FF2816;
@@ -33,7 +33,7 @@
   :root:not([data-theme="light"]){
     color-scheme:dark;
     --paper:#0F1646;--paper-2:#192160;--paper-3:#222B6E;
-    --ink:#EFE6D8;--ink-2:#C6C1D6;--ink-3:#8A8CB4;--line:#2F3A80;
+    --ink:#FEF5E8;--ink-2:#CFC9DB;--ink-3:#8A8CB4;--line:#2F3A80;
     --blue:#9CAAFF;--blue-ink:#0F1646;
     --orange:#FC9B4E;--orange-ink:#FFC48F;--red:#FF6B5E;
     --cover-shadow:0 10px 22px -12px rgba(0,0,0,.7);
@@ -42,7 +42,7 @@
 :root[data-theme="dark"]{
   color-scheme:dark;
   --paper:#0F1646;--paper-2:#192160;--paper-3:#222B6E;
-  --ink:#EFE6D8;--ink-2:#C6C1D6;--ink-3:#8A8CB4;--line:#2F3A80;
+  --ink:#FEF5E8;--ink-2:#CFC9DB;--ink-3:#8A8CB4;--line:#2F3A80;
   --blue:#9CAAFF;--blue-ink:#0F1646;
   --orange:#FC9B4E;--orange-ink:#FFC48F;--red:#FF6B5E;
   --cover-shadow:0 10px 22px -12px rgba(0,0,0,.7);
@@ -377,7 +377,9 @@ function go(){
   }
   track.style.transition="none";track.style.transform="translateX(0)";
   track.innerHTML=strip.map(coverHTML).join("");
-  const step=88+12, dist=WIN*step + (Math.random()*24-12);
+  /* mede a posição real da capa vencedora em vez de assumir larguras fixas */
+  const winEl=track.children[WIN], stage=track.parentElement;
+  const dist=(winEl.offsetLeft+winEl.offsetWidth/2) - stage.clientWidth/2 + (Math.random()*24-12);
   const finish=()=>{spinning=false;spin.disabled=false;show(win,cands)};
   if(reduced){track.style.transform=`translateX(${-dist}px)`;finish();return}
   requestAnimationFrame(()=>requestAnimationFrame(()=>{
