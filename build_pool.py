@@ -48,9 +48,10 @@ SOURCE_WEIGHT = {"gr_most_read": 1.0, "gr_shelf": 0.9, "ol_trending": 0.5}
 
 TRENDING_PER_LIST = 50       # quantos livros pegar de cada lista
 TRENDING_MAX = 300           # tamanho máximo do pool de trending
-CATALOG_PAGES_PER_GENRE = 6  # páginas de ~50 livros por gênero no modo --catalog (≈ 2.000 livros)
+CATALOG_PAGES_PER_GENRE = 4  # páginas de ~50 livros por gênero no modo --catalog (≈ 1.400 livros)
 TOP_SHELVES = 40             # shelves por livro
-SLEEP = 1.4                  # segundos entre requisições ao Goodreads (seja gentil)
+SLEEP = 1.0                  # segundos entre requisições ao Goodreads (seja gentil)
+TIME_BUDGET_MIN = 300        # para antes do limite de 6 h do GitHub Actions e grava o que já tem
 
 # shelves que não dizem nada sobre o conteúdo
 NOISE = re.compile(
@@ -293,7 +294,13 @@ def main():
     ap.add_argument("--catalog", action="store_true", help="reconstrói o catálogo de sementes (mensal)")
     ap.add_argument("--source", choices=["goodreads", "openlibrary"], default="goodreads")
     ap.add_argument("--limit", type=int, default=0, help="só para testar: processa no máximo N livros")
+    ap.add_argument("--minutes", type=int, default=TIME_BUDGET_MIN, help="orçamento de tempo em minutos")
     args = ap.parse_args()
+    t0 = time.time()
+    log(f"início: catálogo={'sim' if args.catalog else 'não'}  fonte={args.source}  orçamento={args.minutes} min")
+
+    def out_of_time() -> bool:
+        return (time.time() - t0) / 60 > args.minutes
 
     cache: dict[str, dict] = load_json(CACHE, {})
     prev = load_json(OUT, {"trending": [], "catalog": []})
@@ -326,7 +333,12 @@ def main():
     def profile(bid: str) -> dict | None:
         if bid in cache and cache[bid].get("tags"):
             return cache[bid]
-        info = ol_work(bid) if bid.startswith("/works/") else (gr_book(bid) if mode == "goodreads" else None)
+        if bid.startswith("/works/"):
+            info = ol_work(bid)
+        elif mode == "goodreads" and bid.isdigit():
+            info = gr_book(bid)
+        else:
+            return None  # id de outra fonte (ou do pool de exemplo): ignora
         if info:
             cache[bid] = info
             CACHE.write_text(json.dumps(cache, ensure_ascii=False))
@@ -334,6 +346,9 @@ def main():
 
     trending = []
     for i, bid in enumerate(ranked, 1):
+        if out_of_time():
+            log("  orçamento de tempo esgotado no trending; gravando o que já tem")
+            break
         info = profile(bid)
         if info and info["tags"]:
             trending.append({**info, "tr": scores[bid], "score": bayes(info["rating"], info["n"])})
@@ -342,6 +357,7 @@ def main():
 
     # -- 3. catálogo de sementes
     catalog_ids: set[str] = {b["id"] for b in prev.get("catalog", [])}
+    catalog_ids.update(load_json(ROOT / "data" / "pending.json", []))
     if args.catalog or not catalog_ids:
         log("reconstruindo catálogo de sementes…")
         if mode == "goodreads":
@@ -359,8 +375,14 @@ def main():
             catalog_ids.add(bid)
     catalog_ids.update(b["id"] for b in trending)
 
-    catalog = []
-    for i, bid in enumerate(sorted(catalog_ids), 1):
+    # o que já está em cache vai primeiro (de graça); o resto até acabar o tempo
+    ordered = sorted(catalog_ids, key=lambda b: (b not in cache, b))
+    catalog, pending = [], 0
+    for i, bid in enumerate(ordered, 1):
+        if out_of_time():
+            pending = len(ordered) - i + 1
+            log(f"  orçamento de tempo esgotado no catálogo; {pending} sementes ficam para a próxima rodada")
+            break
         info = profile(bid)
         if info and info["tags"]:
             catalog.append({**info, "tr": scores.get(bid, 0)})
@@ -377,7 +399,10 @@ def main():
     OUT.parent.mkdir(exist_ok=True)
     OUT.write_text(json.dumps(out, ensure_ascii=False, separators=(",", ":")))
     MISSES.write_text("[]")
-    log(f"ok: {len(trending)} trending, {len(catalog)} sementes → {OUT}")
+    # sementes que não deu tempo de ler ficam anotadas para a próxima rodada completar
+    PENDING = ROOT / "data" / "pending.json"
+    PENDING.write_text(json.dumps([b for b in ordered if b not in cache]) if pending else "[]")
+    log(f"ok: {len(trending)} trending, {len(catalog)} sementes, {pending} pendentes → {OUT}  ({(time.time()-t0)/60:.0f} min)")
 
 
 def find_id(title: str, mode: str) -> str | None:
