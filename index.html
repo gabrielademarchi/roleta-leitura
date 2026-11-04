@@ -105,7 +105,7 @@ h1{
 
 /* capa: placeholder neutro onde entra a capa real; o selo carrega o clima */
 .cover{
-  flex:0 0 88px;height:128px;border-radius:2px 5px 5px 2px;position:relative;
+  flex:0 0 88px;width:88px;min-width:0;height:128px;overflow:hidden;border-radius:2px 5px 5px 2px;position:relative;
   box-shadow:var(--cover-shadow);color:var(--ink);
   background:var(--paper-3);border:1px solid var(--line);
   padding:10px 9px;display:flex;flex-direction:column;justify-content:flex-start;
@@ -117,7 +117,7 @@ h1{
 .cover img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;border-radius:inherit}
 .cover .ct{
   font-family:var(--font-display);font-weight:600;font-size:12.5px;line-height:1.12;
-  letter-spacing:-.01em;margin-left:4px;
+  letter-spacing:-.01em;margin-left:4px;overflow-wrap:anywhere;
   display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden;
 }
 .cover .ca{font-size:9.5px;color:var(--ink-3);margin:4px 0 0 4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -366,7 +366,15 @@ function go(){
   const cands=candidates(seed);
   const win=pick(cands);
   const N=38,WIN=32,strip=[];
-  for(let i=0;i<N;i++) strip.push(i===WIN?win.b:cands[Math.floor(Math.random()*cands.length)].b);
+  const fillers=cands.filter(c=>c!==win).map(c=>c.b);
+  if(!fillers.length)fillers.push(win.b);
+  let bag=[];
+  for(let i=0;i<N;i++){
+    if(i===WIN){strip.push(win.b);continue}
+    if(!bag.length){bag=[...fillers].sort(()=>Math.random()-.5); if(strip.length&&bag[0]===strip[strip.length-1]&&bag.length>1)bag.push(bag.shift())}
+    const next=bag.shift();
+    if(i===WIN+1&&next===win.b&&bag.length){strip.push(bag.shift());bag.push(next)}else strip.push(next);
+  }
   track.style.transition="none";track.style.transform="translateX(0)";
   track.innerHTML=strip.map(coverHTML).join("");
   const step=88+12, dist=WIN*step + (Math.random()*24-12);
