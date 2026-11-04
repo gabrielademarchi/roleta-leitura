@@ -20,6 +20,7 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 340
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -32,6 +33,7 @@ jobs:
           if [ "${{ github.event.inputs.catalog }}" = "true" ] || [ "${{ github.event.schedule }}" = "0 10 1 * *" ]; then
             FLAGS="$FLAGS --catalog"
           fi
+          echo "flags: $FLAGS"
           python build_pool.py $FLAGS
       - name: Salvar dados no repositório
         run: |
