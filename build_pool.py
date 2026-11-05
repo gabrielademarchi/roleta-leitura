@@ -52,6 +52,7 @@ CATALOG_LISTS_PER_GENRE = 3  # listas (Listopia) por gênero no modo --catalog
 CATALOG_PAGES_PER_LIST = 3   # páginas de 100 livros por lista  (7 gêneros × 3 × 3 × 100 ≈ 4–5 mil ids antes da deduplicação)
 CATALOG_MAX = 1500           # teto de sementes novas por rodada (o resto fica pendente para as próximas)
 TOP_SHELVES = 40             # shelves por livro
+PROFILE_VERSION = 2          # suba este número para forçar a releitura de todos os perfis em cache
 SLEEP = 1.0                  # segundos entre requisições ao Goodreads (seja gentil)
 TIME_BUDGET_MIN = 300        # para antes do limite de 6 h do GitHub Actions e grava o que já tem
 
@@ -59,11 +60,14 @@ TIME_BUDGET_MIN = 300        # para antes do limite de 6 h do GitHub Actions e g
 NOISE = re.compile(
     r"^(to-read|currently-reading|read|owned|own|owned-books|books-i-own|favorites|favourites|"
     r"kindle|ebook|e-book|audiobook|audiobooks|audio|library|dnf|did-not-finish|abandoned|"
-    r"default|wish-list|wishlist|to-buy|borrowed|physical|hardcover|paperback|signed|"
+    r"default|wish-list|wishlist|to-buy|want-to-buy|borrowed|physical|physical-tbr|physical-books|"
+    r"hardcover|paperback|signed|to-be-read|did-not-finish-\d+|dnf-\d+|home-library|libby|"
+    r"my-bookshelf|bookshelf|recommended|recommendations|\d{4}-books|read-in-\d{4}|"
+    r"owned-tbr|kindle-unlimited|ku|hoopla|audible|scribd|everand|"
     r"series|standalone|reread|re-read|maybe|tbr|netgalley|arc|arcs|buddy-read|"
-    r"book-club|bookclub|read-in-\d+|\d{4}|\d{4}-reads?|\d{4}-releases?|\d{4}-tbr|"
+    r"book-club|bookclub|read-in-\d+|\d{4}|\d{4}-reads?|\d{4}-releases?|\d{4}-tbr|\d{4}-read|"
     r"fiction|novels?|books|adult|english|my-books|all-time-favorites|5-stars?|4-stars?|"
-    r"3-stars?|favorite-books|top-reads)$"
+    r"science-fiction-fantasy|3-stars?|favorite-books|top-reads)$"
 )
 
 UA = {
@@ -73,6 +77,8 @@ UA = {
 }
 session = requests.Session()
 session.headers.update(UA)
+DROPPED: dict[str, str] = {}   # id → motivo do descarte (gravado em data/dropped.json)
+EMPTY_SHELVES = 0
 
 
 # ----------------------------------------------------------------------------- utils
@@ -89,7 +95,7 @@ def slug(s: str) -> str:
 def get(url: str, **kw) -> requests.Response | None:
     for attempt in range(3):
         try:
-            r = session.get(url, timeout=30, **kw)
+            r = session.get(url, timeout=45, **kw)
             if r.status_code == 200:
                 return r
             if r.status_code in (403, 429):
@@ -166,21 +172,26 @@ def gr_book(book_id: str) -> dict | None:
     r = get(f"https://www.goodreads.com/book/show/{book_id}")
     time.sleep(SLEEP)
     if not r:
-        return None
+        DROPPED[book_id] = "fetch"; return None
     soup = BeautifulSoup(r.text, "html.parser")
     nd = soup.find("script", id="__NEXT_DATA__")
     if not nd:
-        return None
+        DROPPED[book_id] = "no-next-data"; return None
     data = json.loads(nd.string)
     apollo = data.get("props", {}).get("pageProps", {}).get("apolloState", {})
 
     book = next((v for k, v in apollo.items() if k.startswith("Book:") and v.get("titleComplete")), None)
     work = next((v for k, v in apollo.items() if k.startswith("Work:")), {})
     if not book:
-        return None
+        DROPPED[book_id] = "no-book-in-json"; return None
 
     author = next((v["name"] for k, v in apollo.items() if k.startswith("Contributor:") and v.get("name")), "")
     series = next((v["title"] for k, v in apollo.items() if k.startswith("Series:") and v.get("title")), "")
+    series_url = next((v.get("webUrl", "") for k, v in apollo.items() if k.startswith("Series:") and v.get("title")), "")
+    pos = ""
+    bs = book.get("bookSeries") or []
+    if bs and isinstance(bs[0], dict):
+        pos = str(bs[0].get("userPosition") or bs[0].get("seriesPlacement") or "")
     stats = work.get("stats") or book.get("stats") or {}
     details = book.get("details") or {}
     pub = details.get("publicationTime") or (work.get("details") or {}).get("publicationTime")
@@ -191,6 +202,7 @@ def gr_book(book_id: str) -> dict | None:
     desc = re.sub(r"\s+", " ", desc)[:1200]
 
     info = {
+        "v": PROFILE_VERSION,
         "id": book_id,
         "t": book.get("title") or book["titleComplete"],
         "a": author,
@@ -200,12 +212,20 @@ def gr_book(book_id: str) -> dict | None:
         "n": stats.get("ratingsCount"),
         "cover": book.get("imageUrl"),
         "d": desc,
+        "pos": pos,              # posição na série ("1", "2", "0.5", "" se avulso)
+        "series_url": series_url,
         "genres": genres,
         "tags": gr_shelves(book_id),
     }
-    # gêneros do Goodreads entram como tags com peso médio, caso as shelves venham vazias
+    # plano B: os gêneros do Goodreads vêm em ordem de popularidade; viram pesos decrescentes
     if not info["tags"]:
-        info["tags"] = {g: 1.0 / max(1, len(genres)) for g in genres}
+        gs = [g for g in genres if not NOISE.match(g)]
+        n = len(gs)
+        tot = n * (n + 1) / 2 or 1
+        info["tags"] = {g: round((n - i) / tot, 4) for i, g in enumerate(gs)}
+        info["tags_from"] = "genres"
+    if not info["tags"]:
+        DROPPED[book_id] = "no-shelves-no-genres"
     return info
 
 
@@ -216,15 +236,20 @@ def gr_shelves(book_id: str) -> dict[str, float]:
     if not r:
         return {}
     counts: dict[str, int] = {}
-    for m in re.finditer(r'/shelf/show/([\w\-]+)"[^>]*>[^<]*</a>\s*</div>\s*<div class="smallText">\s*([\d,]+)\s+(?:people|person)', r.text):
+    # formato atual: <a href="/genres/sci-fi">sci-fi</a> … <div class="smallText"> 12,897 people
+    # (aceita também o formato antigo /shelf/show/…)
+    pat = re.compile(r'href="/(?:genres|shelf/show)/([\w\-]+)"[^>]*>[^<]*</a>.*?class="smallText"[^>]*>\s*([\d,]+)\s+(?:people|person)', re.S)
+    for m in pat.finditer(r.text):
         name, n = m.group(1).lower(), int(m.group(2).replace(",", ""))
         if not NOISE.match(name):
             counts[name] = counts.get(name, 0) + n
-    if not counts:  # layout mudou? tenta um casamento mais frouxo
-        for m in re.finditer(r"/shelf/show/([\w\-]+)[^\d]{0,200}?([\d,]{2,})\s+(?:people|person)", r.text):
-            name, n = m.group(1).lower(), int(m.group(2).replace(",", ""))
-            if not NOISE.match(name):
-                counts[name] = counts.get(name, 0) + n
+    if not counts:
+        global EMPTY_SHELVES
+        EMPTY_SHELVES += 1
+        if EMPTY_SHELVES <= 3:
+            title = BeautifulSoup(r.text, "html.parser").title
+            log(f"  shelves vazias para {book_id}: página='{title.get_text(strip=True) if title else '?'}' "
+                f"({len(r.text)} bytes, {'pede login' if 'sign_in' in r.url or 'Sign in' in r.text[:5000] else 'sem login'})")
     top = sorted(counts.items(), key=lambda kv: -kv[1])[:TOP_SHELVES]
     tot = sum(n for _, n in top) or 1
     return {k: round(n / tot, 4) for k, n in top}
@@ -271,6 +296,7 @@ def ol_work(key: str) -> dict | None:
         raw = w.json().get("description") or ""
         desc = re.sub(r"\s+", " ", raw["value"] if isinstance(raw, dict) else raw)[:1200]
     return {
+        "v": PROFILE_VERSION,
         "id": "ol" + key.rsplit("/", 1)[-1],
         "t": d.get("title", ""),
         "a": (d.get("author_name") or [""])[0],
@@ -362,7 +388,7 @@ def main():
 
     # -- 2. perfil de cada livro (com cache)
     def profile(bid: str) -> dict | None:
-        if bid in cache and cache[bid].get("tags") and "d" in cache[bid]:
+        if bid in cache and cache[bid].get("tags") and cache[bid].get("v") == PROFILE_VERSION:
             return cache[bid]
         if bid.startswith("/works/"):
             info = ol_work(bid)
@@ -430,6 +456,43 @@ def main():
         if i % 50 == 0:
             log(f"  {i}/{len(catalog_ids)} sementes")
 
+    # -- 3b. saga: no trending, troca volumes 2+ pelo volume 1 (ninguém começa pelo meio)
+    def pos_num(b):
+        try:
+            return float(str(b.get("pos", "")).split("-")[0])
+        except ValueError:
+            return None
+
+    def first_of_series(b):
+        """Volume 1 da mesma série: no cache, ou descoberto pela página da série."""
+        for c in cache.values():
+            if c.get("s") == b["s"] and pos_num(c) == 1 and c.get("tags"):
+                return c
+        if mode == "goodreads" and b.get("series_url"):
+            r = get(b["series_url"])
+            time.sleep(SLEEP)
+            if r:
+                m = re.search(r"Book 1\b.{0,600}?/book/show/(\d+)", r.text, re.S) or re.search(r"/book/show/(\d+)", r.text)
+                if m:
+                    info = profile(m.group(1))
+                    if info and info.get("tags"):
+                        return info
+        return None
+
+    fixed, seen_ids = [], set()
+    for b in trending:
+        pn = pos_num(b)
+        if b.get("s") and pn is not None and pn > 1:
+            first = first_of_series(b)
+            if not first:
+                log(f"  sem volume 1 para '{b['t']}' ({b['s']}); fora do trending")
+                continue
+            b = {**first, "tr": b["tr"], "score": bayes(first.get("rating"), first.get("n")), "via": b["t"]}
+        if b["id"] not in seen_ids:
+            seen_ids.add(b["id"])
+            fixed.append(b)
+    trending = fixed
+
     # -- 4. grava
     out = {
         "updated": date.today().isoformat(),
@@ -444,6 +507,10 @@ def main():
     PENDING = ROOT / "data" / "pending.json"
     left = list(dict.fromkeys([b for b in ordered if b not in cache] + overflow))
     PENDING.write_text(json.dumps(left))
+    (ROOT / "data" / "dropped.json").write_text(json.dumps(DROPPED, indent=0))
+    from collections import Counter
+    log(f"descartes: {dict(Counter(DROPPED.values()))}  shelves vazias: {EMPTY_SHELVES}  "
+        f"perfis só com gêneros: {sum(1 for b in catalog if b.get('tags_from') == 'genres')}/{len(catalog)}")
     log(f"ok: {len(trending)} trending, {len(catalog)} sementes, {len(left)} pendentes para as próximas rodadas → {OUT}  ({(time.time()-t0)/60:.0f} min)")
 
 
