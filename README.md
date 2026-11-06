@@ -5,11 +5,22 @@ entre os livros em alta na semana, um parecido.
 
 ```
 index.html                  a página (lê data/pool.json; capas e busca fora do catálogo ao vivo)
-build_pool.py               o robô: monta data/pool.json a partir do Goodreads + Open Library
+build_pool.py               o robô: monta data/pool.json a partir do Goodreads + Open Library + Google Books
+newsletter.py               monta o e-mail semanal a partir do pool e agenda o envio pelo Kit
+assets/                     logo e bandeirinhas usados no e-mail
 data/pool.json              dados (vem com uma amostra de exemplo; o robô substitui)
+data/nota-da-semana.md      texto livre que entra no topo do e-mail (vazio = sem nota)
 data/misses.json            títulos que você quiser forçar a entrar no catálogo na próxima rodada
-.github/workflows/weekly.yml   agenda: toda segunda (trending) e dia 1 (catálogo de sementes)
+data/newsletter-preview.html  prévia do último e-mail gerado
+.github/workflows/weekly.yml   agenda: toda segunda (trending + newsletter) e dia 1 (catálogo)
 ```
+
+## Segredos (Settings → Secrets and variables → Actions)
+
+- `KIT_API_KEY` — chave da API do Kit; sem ela o robô só gera a prévia do e-mail.
+- `GOOGLE_BOOKS_KEY` — chave da Books API do Google (opcional; evita o limite diário na busca de edições em português).
+
+No `index.html`, cole o id do formulário do Kit em `const KIT_FORM_ID = "…"` para o campo de e-mail aparecer.
 
 ## Subir no GitHub (uma vez só)
 

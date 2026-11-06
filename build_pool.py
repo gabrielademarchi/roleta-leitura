@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -53,6 +54,13 @@ CATALOG_PAGES_PER_LIST = 3   # páginas de 100 livros por lista  (7 gêneros × 
 CATALOG_MAX = 1500           # teto de sementes novas por rodada (o resto fica pendente para as próximas)
 TOP_SHELVES = 40             # shelves por livro
 PROFILE_VERSION = 2          # suba este número para forçar a releitura de todos os perfis em cache
+GOOGLE_BOOKS_KEY = os.environ.get("GOOGLE_BOOKS_KEY", "")   # opcional; sem ela o limite diário é menor
+BR_PUBLISHERS = re.compile(r"intr[ií]nseca|rocco|record|arqueiro|suma|companhia das letras|galera|aleph|darkside|"
+                           r"morro branco|trama|planeta|globo livros|seguinte|novo s[eé]culo|leya|harpercollins brasil|"
+                           r"harper collins brasil|jangada|wish|excelsior|buzz|alt\b|verus|gutenberg|paralela|objetiva|"
+                           r"sextante|[uú]nica|pandorga|faro editorial|nemo|bertrand brasil|saraiva|martins fontes|"
+                           r"todavia|alfaguara|zahar|nova fronteira|melhoramentos|ciranda|pipoca|valentina|charme|"
+                           r"editora jambô|jamb[oô]|conrad|devir|editora alt|agir|harlequin brasil|editora vestígio|vest[ií]gio", re.I)
 SLEEP = 1.0                  # segundos entre requisições ao Goodreads (seja gentil)
 TIME_BUDGET_MIN = 300        # para antes do limite de 6 h do GitHub Actions e grava o que já tem
 
@@ -324,6 +332,76 @@ def ol_popular(subject: str, page: int) -> list[str]:
     return [d["key"] for d in r.json().get("docs", [])] if r else []
 
 
+# ----------------------------------------------------------------------------- tradução (edição brasileira?)
+GB_QUOTA_HIT = False
+
+
+def _is_br_isbn(isbn: str) -> bool:
+    isbn = re.sub(r"[^0-9Xx]", "", isbn or "")
+    return isbn.startswith(("97885", "97865"))
+
+
+def translation_google(title: str, author: str) -> dict | None:
+    """Procura edições em português no Google Books; edição brasileira = ISBN 978-85/978-65 (ou editora BR)."""
+    global GB_QUOTA_HIT
+    if GB_QUOTA_HIT:
+        return None
+    surname = author.split()[-1] if author else ""
+    params = {"q": f'intitle:"{title}" inauthor:"{surname}"', "langRestrict": "pt", "maxResults": 20, "printType": "books"}
+    if GOOGLE_BOOKS_KEY:
+        params["key"] = GOOGLE_BOOKS_KEY
+    try:
+        r = session.get("https://www.googleapis.com/books/v1/volumes", params=params, timeout=30)
+    except requests.RequestException:
+        return None
+    if r.status_code in (403, 429):
+        GB_QUOTA_HIT = True
+        log("  Google Books: limite diário atingido; os selos que faltam ficam para a próxima rodada")
+        return None
+    if r.status_code != 200:
+        return None
+    best = None
+    for it in r.json().get("items", []):
+        vi = it.get("volumeInfo", {})
+        isbns = [i.get("identifier", "") for i in vi.get("industryIdentifiers", []) if i.get("type") == "ISBN_13"]
+        pub = vi.get("publisher", "") or ""
+        if any(_is_br_isbn(i) for i in isbns) or BR_PUBLISHERS.search(pub):
+            cand = {"br": True, "t_pt": vi.get("title", ""), "pub_pt": pub}
+            if pub:          # prefere uma edição com editora preenchida
+                return cand
+            best = best or cand
+    return best or {"br": False}
+
+
+def translation_openlibrary(title: str, author: str) -> dict | None:
+    r = get("https://openlibrary.org/search.json", params={"title": title, "author": author, "fields": "key", "limit": 1})
+    docs = r.json().get("docs", []) if r else []
+    if not docs:
+        return None
+    r = get(f"https://openlibrary.org{docs[0]['key']}/editions.json", params={"limit": 200})
+    if not r:
+        return None
+    for e in r.json().get("entries", []):
+        isbns = e.get("isbn_13", []) or []
+        pubs = " ".join(e.get("publishers", []) or [])
+        langs = [l.get("key", "") for l in e.get("languages", []) or []]
+        if any(_is_br_isbn(i) for i in isbns) or ("/languages/por" in langs and BR_PUBLISHERS.search(pubs)):
+            return {"br": True, "t_pt": e.get("title", ""), "pub_pt": (e.get("publishers") or [""])[0]}
+    return {"br": False}
+
+
+def add_translation(info: dict) -> dict:
+    """Preenche info['br'] (+ título/editora em português) se ainda não tem."""
+    if "br" in info:
+        return info
+    res = translation_google(info["t"], info.get("a", ""))
+    if res is None:
+        res = translation_openlibrary(info["t"], info.get("a", ""))
+    if res is not None:
+        info.update(res)
+    return info
+
+
 # ----------------------------------------------------------------------------- scoring
 def bayes(rating, n, prior_mean=3.9, prior_n=2000) -> float | None:
     """Média bayesiana: puxa livros com poucas avaliações para a média geral."""
@@ -493,6 +571,17 @@ def main():
             fixed.append(b)
     trending = fixed
 
+    # -- 3c. selo de tradução (só no trending, que é o que a roleta e a newsletter mostram)
+    for b in trending:
+        if "br" not in b and not out_of_time():
+            add_translation(b)
+            if b["id"] in cache and "br" in b:
+                cache[b["id"]].update({k: b[k] for k in ("br", "t_pt", "pub_pt") if k in b})
+    CACHE.write_text(json.dumps(cache, ensure_ascii=False))
+    log(f"  selos de tradução: {sum(1 for b in trending if b.get('br'))} em português, "
+        f"{sum(1 for b in trending if b.get('br') is False)} só em inglês, {sum(1 for b in trending if 'br' not in b)} sem resposta")
+
+
     # -- 4. grava
     out = {
         "updated": date.today().isoformat(),
@@ -501,6 +590,8 @@ def main():
         "catalog": sorted(catalog, key=lambda b: -(b["n"] or 0)),
     }
     OUT.parent.mkdir(exist_ok=True)
+    if OUT.exists() and prev.get("updated") != out["updated"]:
+        (ROOT / "data" / "pool_prev.json").write_text(OUT.read_text())   # semana anterior, para "subiu/desceu"
     OUT.write_text(json.dumps(out, ensure_ascii=False, separators=(",", ":")))
     MISSES.write_text("[]")
     # sementes que não deu tempo de ler ficam anotadas para a próxima rodada completar
