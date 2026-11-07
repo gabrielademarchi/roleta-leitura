@@ -31,8 +31,9 @@ import re
 import sys
 import time
 from collections import defaultdict
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
@@ -54,7 +55,12 @@ CATALOG_PAGES_PER_LIST = 3   # páginas de 100 livros por lista  (7 gêneros × 
 CATALOG_MAX = 1500           # teto de sementes novas por rodada (o resto fica pendente para as próximas)
 TOP_SHELVES = 40             # shelves por livro
 PROFILE_VERSION = 2          # suba este número para forçar a releitura de todos os perfis em cache
-GOOGLE_BOOKS_KEY = os.environ.get("GOOGLE_BOOKS_KEY", "")   # opcional; sem ela o limite diário é menor
+GOOGLE_BOOKS_KEY = os.environ.get("GOOGLE_BOOKS_KEY", "")   # opcional; só reserva
+TRANSLATION_VERSION = 2      # suba para recalcular os selos de tradução de todo mundo
+CHANNEL_TAGS = {"fantasy", "science-fiction", "sci-fi", "romance", "romantasy", "thriller", "mystery", "horror",
+                "young-adult", "ya", "dystopia", "paranormal", "urban-fantasy", "epic-fantasy", "high-fantasy",
+                "dark-fantasy", "space-opera", "fae", "dragons", "magic", "suspense", "crime", "gothic",
+                "science-fiction-fantasy", "fantasy-romance", "paranormal-romance", "cozy-fantasy", "grimdark"}
 BR_PUBLISHERS = re.compile(r"intr[ií]nseca|rocco|record|arqueiro|suma|companhia das letras|galera|aleph|darkside|"
                            r"morro branco|trama|planeta|globo livros|seguinte|novo s[eé]culo|leya|harpercollins brasil|"
                            r"harper collins brasil|jangada|wish|excelsior|buzz|alt\b|verus|gutenberg|paralela|objetiva|"
@@ -209,9 +215,11 @@ def gr_book(book_id: str) -> dict | None:
     desc = BeautifulSoup(book.get("description") or "", "html.parser").get_text(" ", strip=True)
     desc = re.sub(r"\s+", " ", desc)[:1200]
 
+    wid = next((k.split(":", 1)[1] for k in apollo if k.startswith("Work:")), "")
     info = {
         "v": PROFILE_VERSION,
         "id": book_id,
+        "wid": wid,
         "t": book.get("title") or book["titleComplete"],
         "a": author,
         "s": series,
@@ -347,16 +355,23 @@ def translation_google(title: str, author: str) -> dict | None:
     if GB_QUOTA_HIT:
         return None
     surname = author.split()[-1] if author else ""
-    params = {"q": f'intitle:"{title}" inauthor:"{surname}"', "langRestrict": "pt", "maxResults": 20, "printType": "books"}
+    params = {"q": f"{title} {surname}", "langRestrict": "pt", "maxResults": 20, "printType": "books"}
     if GOOGLE_BOOKS_KEY:
         params["key"] = GOOGLE_BOOKS_KEY
     try:
         r = session.get("https://www.googleapis.com/books/v1/volumes", params=params, timeout=30)
     except requests.RequestException:
         return None
+    if r.status_code == 429:
+        log("  Google Books: limite por minuto; esperando 60 s")
+        time.sleep(60)
+        try:
+            r = session.get("https://www.googleapis.com/books/v1/volumes", params=params, timeout=30)
+        except requests.RequestException:
+            return None
     if r.status_code in (403, 429):
         GB_QUOTA_HIT = True
-        log("  Google Books: limite diário atingido; os selos que faltam ficam para a próxima rodada")
+        log("  Google Books: limite atingido; os selos que faltam ficam para a próxima rodada")
         return None
     if r.status_code != 200:
         return None
@@ -390,15 +405,86 @@ def translation_openlibrary(title: str, author: str) -> dict | None:
     return {"br": False}
 
 
+EDITIONS_EMPTY = 0
+
+
+def gr_work_id(book_id: str) -> str:
+    """Id da obra a partir do id do livro, sem baixar a página inteira: /book/shelves/{id} redireciona para /work/shelves/{wid}."""
+    try:
+        r = session.get(f"https://www.goodreads.com/book/shelves/{book_id}", allow_redirects=False, timeout=30)
+        time.sleep(SLEEP / 2)
+        m = re.search(r"/work/shelves/(\d+)", r.headers.get("Location", ""))
+        if m:
+            return m.group(1)
+        if r.status_code == 200:   # não redirecionou: tenta achar o id no corpo
+            m = re.search(r"/work/(?:editions|shelves)/(\d+)", r.text)
+            return m.group(1) if m else ""
+    except requests.RequestException:
+        pass
+    return ""
+
+
+def translation_goodreads(wid: str) -> dict | None:
+    """Lê a página de edições da obra: edição em português com ISBN 978-85/65 (ou editora BR) = edição brasileira.
+    Devolve None só quando não consegue ler a página (aí cai para as reservas)."""
+    global EDITIONS_EMPTY
+    if not wid:
+        return None
+    found_any, best = False, None
+    for page in (1, 2, 3):
+        r = get(f"https://www.goodreads.com/work/editions/{wid}",
+                params={"filter_by_editions": "all", "per_page": 100, "page": page})
+        time.sleep(SLEEP)
+        if not r:
+            return None if page == 1 else ({"br": False} if found_any else None)
+        soup = BeautifulSoup(r.text, "html.parser")
+        blocks = soup.select("div.elementList")
+        if not blocks:
+            if page == 1:
+                EDITIONS_EMPTY += 1
+                if EDITIONS_EMPTY <= 3:
+                    title = soup.title.get_text(strip=True) if soup.title else "?"
+                    log(f"  edições vazias para work {wid}: página='{title}' ({len(r.text)} bytes)")
+                return None
+            break
+        found_any = True
+        for b in blocks:
+            text = b.get_text("\n", strip=True)
+            lang = re.search(r"Edition language:\s*([A-Za-z]+)", text)
+            if not lang or lang.group(1).lower() != "portuguese":
+                continue
+            isbn = re.search(r"ISBN:\s*(97[89]\d{10})", text)
+            pub = re.search(r"Published .*? by (.+)", text)
+            pub = pub.group(1).strip() if pub else ""
+            title_el = b.select_one(".bookTitle")
+            title = title_el.get_text(strip=True) if title_el else ""
+            title = re.sub(r"\s*\(.*?\)\s*$", "", title)           # tira "(Red Rising Trilogy, #1)"
+            if (isbn and _is_br_isbn(isbn.group(1))) or BR_PUBLISHERS.search(pub):
+                cand = {"br": True, "t_pt": title, "pub_pt": pub}
+                if pub and isbn:
+                    return cand
+                best = best or cand
+        if len(blocks) < 100:
+            break
+    return best or {"br": False}
+
+
 def add_translation(info: dict) -> dict:
-    """Preenche info['br'] (+ título/editora em português) se ainda não tem."""
-    if "br" in info:
+    """Preenche info['br'] (+ título/editora em português) se ainda não tem, ou se o selo é de versão antiga."""
+    if info.get("brv") == TRANSLATION_VERSION:
         return info
-    res = translation_google(info["t"], info.get("a", ""))
+    for k in ("br", "t_pt", "pub_pt"):
+        info.pop(k, None)
+    if not info.get("wid") and str(info.get("id", "")).isdigit():
+        info["wid"] = gr_work_id(info["id"])            # perfis antigos não guardaram a obra
+    res = translation_goodreads(info.get("wid", ""))
+    if res is None:
+        res = translation_google(info["t"], info.get("a", ""))
     if res is None:
         res = translation_openlibrary(info["t"], info.get("a", ""))
     if res is not None:
         info.update(res)
+        info["brv"] = TRANSLATION_VERSION
     return info
 
 
@@ -534,6 +620,14 @@ def main():
         if i % 50 == 0:
             log(f"  {i}/{len(catalog_ids)} sementes")
 
+    # -- 3a. só os gêneros do canal (tira não-ficção e literatura geral que entram pelo Open Library)
+    def is_channel(b):
+        top = [k for k, _ in sorted(b["tags"].items(), key=lambda kv: -kv[1])[:8]]
+        return bool(CHANNEL_TAGS & set(top)) or bool(CHANNEL_TAGS & set(b.get("genres", [])[:5]))
+    before_n = len(trending)
+    trending = [b for b in trending if is_channel(b)]
+    log(f"  fora do gênero do canal: {before_n - len(trending)} de {before_n}")
+
     # -- 3b. saga: no trending, troca volumes 2+ pelo volume 1 (ninguém começa pelo meio)
     def pos_num(b):
         try:
@@ -573,18 +667,30 @@ def main():
 
     # -- 3c. selo de tradução (só no trending, que é o que a roleta e a newsletter mostram)
     for b in trending:
-        if "br" not in b and not out_of_time():
+        if b.get("brv") != TRANSLATION_VERSION and not out_of_time():
             add_translation(b)
-            if b["id"] in cache and "br" in b:
-                cache[b["id"]].update({k: b[k] for k in ("br", "t_pt", "pub_pt") if k in b})
+            if b["id"] in cache and "brv" in b:
+                cache[b["id"]].update({k: b[k] for k in ("br", "t_pt", "pub_pt", "brv", "wid") if k in b})
     CACHE.write_text(json.dumps(cache, ensure_ascii=False))
     log(f"  selos de tradução: {sum(1 for b in trending if b.get('br'))} em português, "
-        f"{sum(1 for b in trending if b.get('br') is False)} só em inglês, {sum(1 for b in trending if 'br' not in b)} sem resposta")
+        f"{sum(1 for b in trending if b.get('br') is False)} só em inglês, {sum(1 for b in trending if 'br' not in b)} sem resposta"
+        f"  (páginas de edições ilegíveis: {EDITIONS_EMPTY})")
 
+
+    # -- 3d. uma entrada por obra (edições diferentes do mesmo livro viram uma só; fica a mais avaliada)
+    def dedupe_by_work(items):
+        best = {}
+        for b in items:
+            key = b.get("wid") or b["id"]
+            if key not in best or (b.get("n") or 0) > (best[key].get("n") or 0):
+                best[key] = b
+        return list(best.values())
+    trending = dedupe_by_work(trending)
+    catalog = dedupe_by_work(catalog)
 
     # -- 4. grava
     out = {
-        "updated": date.today().isoformat(),
+        "updated": datetime.now(ZoneInfo("America/Sao_Paulo")).date().isoformat(),
         "source": mode,
         "trending": sorted(trending, key=lambda b: -b["tr"]),
         "catalog": sorted(catalog, key=lambda b: -(b["n"] or 0)),

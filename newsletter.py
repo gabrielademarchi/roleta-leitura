@@ -11,8 +11,7 @@ e cria um broadcast no Kit agendado para daqui a alguns minutos.
 Conteúdo, nesta ordem:
   1. Nota da semana — o texto de data/nota-da-semana.md, se houver (parágrafos, **negrito**, [links](url))
   2. Os 5 que mais subiram no BookTok esta semana (ou os 5 mais em alta, se não houver semana anterior)
-  3. Um por clima — 3 livros para quem quer "se apaixonar", "ir para outro mundo" e "sentir medo/tensão"
-  4. Link para a roleta
+  3. Link para a roleta
 """
 from __future__ import annotations
 
@@ -24,6 +23,7 @@ import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -42,13 +42,6 @@ PREVIEW = ROOT / "data" / "newsletter-preview.html"
 
 # paleta do canal
 BEGE, AZUL, LARANJA, TINTA, TINTA2, LINHA = "#f9f5ef", "#16289B", "#FC9B4E", "#121B5C", "#3A4380", "#e3dacb"
-
-MOODS = [
-    ("Para quem quer se apaixonar", {"romance", "romantasy", "slow-burn", "enemies-to-lovers", "fae"}),
-    ("Para quem quer ir para outro mundo", {"fantasy", "epic", "worldbuilding", "science-fiction", "space"}),
-    ("Para quem quer sentir medo ou tensão", {"thriller", "horror", "dark", "mystery", "psychological"}),
-]
-
 
 def log(*a):
     print(*a, file=sys.stderr, flush=True)
@@ -82,25 +75,6 @@ def risers(cur: list[dict], prev: list[dict], n=5) -> tuple[list[dict], bool]:
     return picked, True
 
 
-def by_mood(cur: list[dict], exclude: set[str]) -> list[tuple[str, dict]]:
-    out = []
-    used = set(exclude)
-    used_series = {b.get("s") for b in cur if b["id"] in exclude and b.get("s")}
-    for label, tags in MOODS:
-        best, best_s = None, 0
-        for b in cur:
-            if b["id"] in used or (b.get("s") and b["s"] in used_series):
-                continue
-            s = sum(w for k, w in b["tags"].items() if k in tags) * (0.5 + b["tr"] / 100)
-            if s > best_s:
-                best, best_s = b, s
-        if best:
-            used.add(best["id"])
-            if best.get("s"):
-                used_series.add(best["s"])
-            out.append((label, best))
-    return out
-
 
 # ----------------------------------------------------------------------------- render
 def md_lite(text: str) -> str:
@@ -119,8 +93,6 @@ def md_lite(text: str) -> str:
 def flag(b: dict) -> str:
     if b.get("br"):
         return f'<img src="{ASSETS}flag-br.png" width="16" height="16" alt="em português" style="vertical-align:-3px;margin-left:6px">'
-    if b.get("br") is False:
-        return f'<img src="{ASSETS}flag-us.png" width="16" height="16" alt="só em inglês" style="vertical-align:-3px;margin-left:6px">'
     return ""
 
 
@@ -153,7 +125,6 @@ def book_row(b: dict, badge: str = "") -> str:
 def render(pool: dict, prev: dict, note: str) -> tuple[str, str]:
     cur = pool["trending"]
     top, has_prev = risers(cur, prev.get("trending", []))
-    moods = by_mood(cur, {b["id"] for b in top})
     when = datetime.fromisoformat(pool["updated"]).strftime("%d/%m")
 
     subject = f"Em alta esta semana: {top[0]['t']} e mais {len(top) - 1}" if top else "Os livros em alta esta semana"
@@ -163,7 +134,6 @@ def render(pool: dict, prev: dict, note: str) -> tuple[str, str]:
     for b in top:
         badge = ("Novo na lista" if b.get("novo") else (f"Subiu {b['delta']:.0f} pontos" if b.get("delta", 0) > 0 else "")) if has_prev else ""
         rows_top += book_row(b, badge)
-    rows_mood = "".join(book_row(b, label) for label, b in moods)
 
     body = f"""<!DOCTYPE html>
 <html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>{html.escape(subject)}</title></head>
@@ -179,8 +149,6 @@ def render(pool: dict, prev: dict, note: str) -> tuple[str, str]:
   {f'<tr><td style="padding-top:18px">{md_lite(note)}</td></tr>' if note.strip() else ''}
   <tr><td>{h}{"Os 5 que mais subiram" if has_prev else "Os 5 mais em alta"}</h2>
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0">{rows_top}</table></td></tr>
-  <tr><td>{h}Um para cada clima</h2>
-    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">{rows_mood}</table></td></tr>
   <tr><td style="padding:30px 0 10px">
     <a href="{SITE_URL}" style="display:inline-block;background:{AZUL};color:{BEGE};text-decoration:none;font-weight:600;font-size:16px;padding:14px 24px;border-radius:999px">Girar a roleta da próxima leitura</a>
   </td></tr>
@@ -231,7 +199,7 @@ def main():
     if not KIT_API_KEY:
         log("KIT_API_KEY não configurada; só a prévia foi gerada")
         return
-    today = datetime.now(timezone.utc).date().isoformat()
+    today = datetime.now(ZoneInfo("America/Sao_Paulo")).date().isoformat()
     if pool.get("updated") != today and not args.force:
         log(f"pool.json é de {pool.get('updated')}, não de hoje — não envio (use --force para mandar mesmo assim)")
         return
