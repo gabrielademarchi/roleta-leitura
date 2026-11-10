@@ -42,13 +42,6 @@ jobs:
           fi
           echo "flags: $FLAGS"
           python build_pool.py $FLAGS
-      - name: Newsletter
-        run: |
-          if [ "${{ inputs.newsletter }}" = "true" ] || [ "${{ github.event.schedule }}" = "0 9 * * 1" ]; then
-            python newsletter.py
-          else
-            python newsletter.py --preview
-          fi
       - name: Salvar dados no repositório
         run: |
           git config user.name "roleta-bot"
@@ -56,3 +49,17 @@ jobs:
           git add data/
           git diff --cached --quiet || git commit -m "dados: $(date -u +%Y-%m-%d)"
           git push
+      - name: Newsletter
+        run: |
+          if [ "${{ inputs.newsletter }}" = "true" ] || [ "${{ github.event.schedule }}" = "0 9 * * 1" ]; then
+            python newsletter.py
+          else
+            python newsletter.py --preview
+          fi
+      - name: Salvar prévia da newsletter
+        if: always()
+        run: |
+          git add data/newsletter-preview.html 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "prévia da newsletter: $(date -u +%Y-%m-%d)"
+          git pull --rebase --quiet || true
+          git push || true
